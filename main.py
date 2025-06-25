@@ -11,6 +11,7 @@ from supabase import create_client, Client
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
+import re
 
 # .envの読み込み
 load_dotenv()
@@ -36,6 +37,8 @@ async def register_user(user: UserRegister):
 line_bot_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 
+user_latest_ticker = {}
+
 @app.post("/callback")
 async def callback(request: Request):
     signature = request.headers["X-Line-Signature"]
@@ -59,62 +62,16 @@ def get_ticker_candidates(company_name: str):
     soup = BeautifulSoup(res.text, "lxml")
 
     candidates = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True)
-        if "/quote/" in href and ".T" in href:
-            ticker = href.split("/quote/")[-1].strip()
-            if (ticker, text) not in candidates:
-                candidates.append((ticker, text))
+    for h2 in soup.select("h2.SearchItem__name__1ApM"):
+        a = h2.find_parent("a", href=True)  # 企業名が含まれてるリンクを探す
+        if a and "/quote/" in a["href"]:
+            ticker = a["href"].split("/quote/")[-1]
+            name = h2.text.strip()
+            if ".T" in ticker:
+                candidates.append((ticker, name))
         if len(candidates) >= 5:
             break
     return candidates
-
-def fetch_stock_info(company_name: str):
-    candidates = get_ticker_candidates(company_name)
-    if not candidates:
-        return {"error": f"{company_name} の証券コードが見つかりませんでした。"}
-    ticker, _ = candidates[0]
-
-    detail_url = f"https://finance.yahoo.co.jp/quote/{ticker}"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-    res = requests.get(detail_url, headers=headers)
-    soup = BeautifulSoup(res.text, "lxml")
-
-    rows = soup.select("table tbody tr")
-    info_map = {}
-
-    try:
-        for row in rows:
-            th = row.select_one("th")
-            td = row.select_one("td")
-            if th and td:
-                label = th.text.strip()
-                value = td.text.strip()
-                if "前日終値" in label:
-                    info_map["prev_close"] = value
-                elif "始値" in label:
-                    info_map["open"] = value
-                elif "高値" in label:
-                    info_map["high"] = value
-                elif "安値" in label:
-                    info_map["low"] = value
-                elif "出来高" in label:
-                    info_map["volume"] = value
-                elif "売買代金" in label:
-                    info_map["value"] = value
-                elif "値幅制限" in label:
-                    info_map["range"] = value
-    except Exception as e:
-        return {"error": f"{company_name} の株価情報を解析できませんでした。"}
-
-    return {
-        "company_name": company_name,
-        **info_map,
-        "detail_url": detail_url
-    }
 
 # フォローイベントのハンドラを追加
 @handler.add(FollowEvent)
@@ -164,7 +121,7 @@ def handle_message(event):
     print("受信したテキスト:", text)
     line_user_id = event.source.user_id
 
-    # 🌟 ユーザーのプロフィール取得
+    # ユーザーのプロフィール取得
     try:
         profile = line_bot_api.get_profile(line_user_id)
         user_name = profile.display_name
@@ -175,7 +132,7 @@ def handle_message(event):
     if text.startswith("レベル:"):
         level = text.replace("レベル:", "")
         # Supabaseに保存
-        supabase.table("users").upsert({
+        supabase.table("line_users").upsert({
             "line_user_id": line_user_id,
             "name": user_name,
             "experience": level,
@@ -224,114 +181,282 @@ def handle_message(event):
             text="それでは、通知を受け取りたい企業名を入力してください！（例：トヨタ）"
         ))
     else:
-        if text.startswith("候補:"):
-            ticker = text.replace("候補:", "")
-            detail_url = f"https://finance.yahoo.co.jp/quote/{ticker}"
-            headers = {"User-Agent": "Mozilla/5.0"}
-            res = requests.get(detail_url, headers=headers)
-            soup = BeautifulSoup(res.text, "lxml")
-
-            rows = soup.select("table tbody tr")
-            info_map = {}
-            for row in rows:
-                th = row.select_one("th")
-                td = row.select_one("td")
-                if th and td:
-                    label = th.text.strip()
-                    value = td.text.strip()
-                    if "前日終値" in label:
-                        info_map["prev_close"] = value
-                    elif "始値" in label:
-                        info_map["open"] = value
-                    elif "高値" in label:
-                        info_map["high"] = value
-                    elif "安値" in label:
-                        info_map["low"] = value
-                    elif "出来高" in label:
-                        info_map["volume"] = value
-                    elif "売買代金" in label:
-                        info_map["value"] = value
-                    elif "値幅制限" in label:
-                        info_map["range"] = value
-
-            reply_text = (
-                f"【{ticker}】\n"
-                f"前日終値: {info_map.get('prev_close')}\n"
-                f"始値: {info_map.get('open')}\n"
-                f"高値: {info_map.get('high')}\n"
-                f"安値: {info_map.get('low')}\n"
-                f"出来高: {info_map.get('volume')}\n"
-                f"売買代金: {info_map.get('value')}\n"
-                f"値幅制限: {info_map.get('range')}\n"
-                f"詳細: {detail_url}"
+        # 通知設定: の受信時
+        if text.startswith("通知設定:"):
+            ticker = text.replace("通知設定:", "")
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="通知の条件を下記のように入力してください！\n\n【時間ベースが良い時】\n・毎日５時\n・毎週木曜の17時\n・毎月23日の0時\n【変動ベースが良い時】\n・5％上がった時\n・25%下がった時\n・株価が5000円を超えた時\n・株価が1600円を下回った時")
             )
+            return
+        # 通知条件の受信時
+        elif text.startswith("毎") or ("上が" in text) or ("下が" in text) or ("円を超え" in text) or ("円を下回" in text):
+            condition = parse_notification_condition(text)
+            ticker = user_latest_ticker.get(line_user_id)
+            if not ticker:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="企業名が正しく設定されていません。\n先に企業名を入力してください！")
+                )
+                return
+            # Supabaseに通知設定を保存
+            supabase.table("notifications").insert({
+                "line_user_id": line_user_id,
+                "condition_type": condition.get("type"),
+                "condition_detail": str(condition),
+                "ticker": ticker,  # add the ticker to enable checking
+                "user_name": user_name
+            }).execute()
+
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        "通知設定が完了しました！\n"
+                        "指定した条件で株価の通知をお届けします！\n\n"
+                        "もし設定をやり直したいときは、\n"
+                        "「通知取り消し選択」または「初期化」と送ってください！\n\n"
+                        "他に通知を受け取りたい企業があったら企業名を入力してください！\n\n"
+                        "それでは引き続き「おおきなかぶ」をご活用ください！"
+                    )
+                )
+            )
+            return
+        # 通知取り消し選択肢表示
+        elif text == "通知取り消し選択":
+            # 登録済み企業リストを取得
+            notifications = supabase.table("notifications").select("ticker").eq("line_user_id", line_user_id).execute().data
+            tickers = list(set(n["ticker"] for n in notifications if "ticker" in n))
+            if not tickers:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="現在、通知登録されている企業はありません"))
+                return
+            quick_items = [
+                QuickReplyButton(action=MessageAction(label=t, text=f"通知取消:{t}")) for t in tickers
+            ]
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="通知を取り消したい企業を選んでください！",
+                quick_reply=QuickReply(items=quick_items)
+            ))
+            return
+
+        elif text.startswith("通知取消:"):
+            ticker = text.replace("通知取消:", "")
+            supabase.table("notifications").delete().eq("line_user_id", line_user_id).eq("ticker", ticker).execute()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"{ticker} の通知設定を取り消しました！"
+            ))
+            return
+
+        elif text == "初期化":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="登録された情報が全て取り消され、初期化します。\n本当によろしいですか？",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="はい", text="リセット確認:はい")),
+                    QuickReplyButton(action=MessageAction(label="いいえ", text="リセット確認:いいえ")),
+                ])
+            ))
+            return
+
+        elif text == "リセット確認:はい":
+            supabase.table("notifications").delete().eq("line_user_id", line_user_id).execute()
+            supabase.table("line_users").delete().eq("line_user_id", line_user_id).execute()
+
+            line_bot_api.push_message(line_user_id, TextSendMessage(
+                text="登録情報を全て削除しました！\nはじめからやり直します！"
+            ))
+
+            line_bot_api.push_message(line_user_id, TextSendMessage(
+                text="まずはあなたの投資レベルを教えてください！",
+                quick_reply=QuickReply(
+                    items=[
+                        QuickReplyButton(action=MessageAction(label="初心者", text="レベル:初心者")),
+                        QuickReplyButton(action=MessageAction(label="中級者", text="レベル:中級者")),
+                        QuickReplyButton(action=MessageAction(label="上級者", text="レベル:上級者")),
+                    ]
+                )
+            ))
+            return
+
+        elif text == "リセット確認:いいえ":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="了解です！引き続きBotをご活用ください。"
+            ))
+            return
+        # 通知スキップ
+        elif text == "通知スキップ":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="通知設定をスキップしました！")
+            )
+            return
+        else:
+            if text.startswith("候補:"):
+                ticker = text.replace("候補:", "")
+            else:
+                candidates = get_ticker_candidates(text)
+                if not candidates:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f"{text} に対応する証券コードが見つかりませんでした。")
+                    )
+                    return
+
+                if len(candidates) == 1:
+                    ticker, _ = candidates[0]
+                else:
+                    quick_items = [
+                        QuickReplyButton(action=MessageAction(label=name, text=f"候補:{code}"))
+                        for code, name in candidates
+                    ]
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(
+                            text="候補が複数見つかりました。該当する企業を選んでください！",
+                            quick_reply=QuickReply(items=quick_items)
+                        )
+                    )
+                    return
+
+            user_latest_ticker[line_user_id] = ticker
+
+            detail_url = f"https://finance.yahoo.co.jp/quote/{ticker}"
+            try:
+                stock = yf.Ticker(ticker)
+                info = stock.info
+
+                reply_text = (
+                    f"【{ticker}】\n"
+                    f"現在値: {info.get('currentPrice', 'N/A')}円\n"
+                    f"前日終値: {info.get('previousClose', 'N/A')}円\n"
+                    f"始値: {info.get('open', 'N/A')}円\n"
+                    f"高値: {info.get('dayHigh', 'N/A')}円\n"
+                    f"安値: {info.get('dayLow', 'N/A')}円\n"
+                    f"出来高: {info.get('volume', 'N/A')}\n"
+                    f"詳細: {detail_url}"
+                )
+            except Exception as e:
+                reply_text = f"株価情報の取得中にエラーが発生しました: {e}"
+
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text=reply_text)
             )
-        else:
-            candidates = get_ticker_candidates(text)
-            if not candidates:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=f"{text} に対応する証券コードが見つかりませんでした。")
-                )
-                return
-
-            if len(candidates) == 1:
-                ticker, _ = candidates[0]
-                detail_url = f"https://finance.yahoo.co.jp/quote/{ticker}"
-                headers = {"User-Agent": "Mozilla/5.0"}
-                res = requests.get(detail_url, headers=headers)
-                soup = BeautifulSoup(res.text, "lxml")
-
-                rows = soup.select("table tbody tr")
-                info_map = {}
-                for row in rows:
-                    th = row.select_one("th")
-                    td = row.select_one("td")
-                    if th and td:
-                        label = th.text.strip()
-                        value = td.text.strip()
-                        if "前日終値" in label:
-                            info_map["prev_close"] = value
-                        elif "始値" in label:
-                            info_map["open"] = value
-                        elif "高値" in label:
-                            info_map["high"] = value
-                        elif "安値" in label:
-                            info_map["low"] = value
-                        elif "出来高" in label:
-                            info_map["volume"] = value
-                        elif "売買代金" in label:
-                            info_map["value"] = value
-                        elif "値幅制限" in label:
-                            info_map["range"] = value
-
-                info_text = (
-                    f"【{ticker}】\n"
-                    f"前日終値: {info_map.get('prev_close')}\n"
-                    f"始値: {info_map.get('open')}\n"
-                    f"高値: {info_map.get('high')}\n"
-                    f"安値: {info_map.get('low')}\n"
-                    f"出来高: {info_map.get('volume')}\n"
-                    f"売買代金: {info_map.get('value')}\n"
-                    f"値幅制限: {info_map.get('range')}\n"
-                    f"詳細: {detail_url}"
-                )
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=info_text)
-                )
-            else:
-                quick_items = [
-                    QuickReplyButton(action=MessageAction(label=name, text=f"候補:{code}"))
-                    for code, name in candidates
-                ]
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(
-                        text="候補が複数見つかりました。該当する企業を選んでくださいにゃ！",
-                        quick_reply=QuickReply(items=quick_items)
+            # 株価通知を受け取るか確認
+            line_bot_api.push_message(
+                line_user_id,
+                TextSendMessage(
+                    text="この株価の通知を受け取りますか？",
+                    quick_reply=QuickReply(
+                        items=[
+                            QuickReplyButton(action=MessageAction(label="受け取る", text=f"通知設定:{ticker}")),
+                            QuickReplyButton(action=MessageAction(label="受け取らない", text="通知スキップ")),
+                        ]
                     )
                 )
+            )
+# 通知条件のテキストから条件を解析する関数
+def parse_notification_condition(text: str):
+    # 毎日
+    if "毎日" in text:
+        times = re.findall(r"\d{1,2}時", text)
+        return {"type": "daily", "times": times}
+
+    # 毎週
+    elif "毎週" in text:
+        match = re.match(r"毎週(.+?)の(\d{1,2})時", text)
+        if match:
+            return {"type": "weekly", "day": match[1], "time": f"{match[2]}時"}
+
+    # 毎月
+    elif "毎月" in text:
+        match = re.match(r"毎月(\d{1,2})日の(\d{1,2})時", text)
+        if match:
+            return {"type": "monthly", "day": int(match[1]), "time": f"{match[2]}時"}
+
+    # 上昇変動通知（%）
+    elif re.search(r"\d+%.*上が", text):
+        percent = re.search(r"(\d+)%", text).group(1)
+        return {"type": "percent_up", "percent": int(percent)}
+
+    # 下降変動通知（%）
+    elif re.search(r"\d+%.*下が", text):
+        percent = re.search(r"(\d+)%", text).group(1)
+        return {"type": "percent_down", "percent": int(percent)}
+
+    # 株価が○円を超えたら通知
+    elif "円を超え" in text:
+        match = re.search(r"(\d+)円", text)
+        return {"type": "price_over", "price": int(match.group(1))}
+
+    # 株価が○円を下回ったら通知
+    elif "円を下回" in text:
+        match = re.search(r"(\d+)円", text)
+        return {"type": "price_under", "price": int(match.group(1))}
+
+    return {"type": "unknown"}
+
+def check_and_send_notifications():
+    from datetime import datetime
+    now = datetime.now()
+
+    # 通知設定を取得
+    notifications = supabase.table("notifications").select("*").execute().data
+    for n in notifications:
+        user_id = n["line_user_id"]
+        cond_type = n["condition_type"]
+        cond_detail = eval(n["condition_detail"])  # JSON文字列を辞書に戻す
+        ticker = n.get("ticker", "7203.T")  # 仮にticker情報を追加
+
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        current_price = info.get("currentPrice")
+        prev_close = info.get("previousClose")
+
+        if cond_type == "daily":
+            now_hour = f"{now.hour}時"
+            if now_hour in cond_detail.get("times", []):
+                send_stock_info(user_id, ticker, info)
+
+        elif cond_type == "weekly":
+            weekday_map = ["月", "火", "水", "木", "金", "土", "日"]
+            today = weekday_map[now.weekday()]
+            if cond_detail["day"] == today and cond_detail["time"] == f"{now.hour}時":
+                send_stock_info(user_id, ticker, info)
+
+        elif cond_type == "monthly":
+            if now.day == cond_detail["day"] and cond_detail["time"] == f"{now.hour}時":
+                send_stock_info(user_id, ticker, info)
+
+        elif cond_type in ["percent_up", "percent_down"]:
+            if prev_close and current_price:
+                diff_percent = ((current_price - prev_close) / prev_close) * 100
+                if cond_type == "percent_up" and diff_percent >= cond_detail["percent"]:
+                    send_stock_info(user_id, ticker, info, diff_percent)
+                elif cond_type == "percent_down" and diff_percent <= -cond_detail["percent"]:
+                    send_stock_info(user_id, ticker, info, diff_percent)
+
+        elif cond_type == "price_over":
+            if current_price >= cond_detail["price"]:
+                send_stock_info(user_id, ticker, info)
+
+        elif cond_type == "price_under":
+            if current_price <= cond_detail["price"]:
+                send_stock_info(user_id, ticker, info)
+
+def send_stock_info(user_id, ticker, info, diff_percent=None):
+    detail_url = f"https://finance.yahoo.co.jp/quote/{ticker}"
+    price_info = (
+        f"【{ticker}】\n"
+        f"現在値: {info.get('currentPrice', 'N/A')}円\n"
+        f"前日終値: {info.get('previousClose', 'N/A')}円\n"
+        f"始値: {info.get('open', 'N/A')}円\n"
+        f"高値: {info.get('dayHigh', 'N/A')}円\n"
+        f"安値: {info.get('dayLow', 'N/A')}円\n"
+        f"出来高: {info.get('volume', 'N/A')}\n"
+        f"詳細: {detail_url}"
+    )
+
+    if diff_percent is not None:
+        price_info = f"株価が{'上昇' if diff_percent > 0 else '下降'}しました（{diff_percent:.2f}%）\n\n" + price_info
+
+    line_bot_api.push_message(user_id, TextSendMessage(text=price_info))
