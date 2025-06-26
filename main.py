@@ -25,19 +25,16 @@ class UserRegister(BaseModel):
     line_user_id: str
     experience: str
 
-@app.post("/register")
-async def register_user(user: UserRegister):
-    response = supabase.table("line_users").insert({
-        "line_user_id": user.line_user_id,
-        "experience": user.experience
-    }).execute()
-    return {"status": "ok", "data": response.data}
-
 # LINE APIの初期化
 line_bot_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("LINE_CHANNEL_SECRET"))
 
 user_latest_ticker = {}
+
+@app.get("/run-check")
+async def run_check():
+    check_and_send_notifications()
+    return {"status": "通知チェック完了です！"}
 
 @app.post("/callback")
 async def callback(request: Request):
@@ -132,7 +129,7 @@ def handle_message(event):
     if text.startswith("レベル:"):
         level = text.replace("レベル:", "")
         # Supabaseに保存
-        supabase.table("line_users").upsert({
+        supabase.table("users").upsert({
             "line_user_id": line_user_id,
             "name": user_name,
             "experience": level,
@@ -259,7 +256,7 @@ def handle_message(event):
 
         elif text == "リセット確認:はい":
             supabase.table("notifications").delete().eq("line_user_id", line_user_id).execute()
-            supabase.table("line_users").delete().eq("line_user_id", line_user_id).execute()
+            supabase.table("users").delete().eq("line_user_id", line_user_id).execute()
 
             line_bot_api.push_message(line_user_id, TextSendMessage(
                 text="登録情報を全て削除しました！\nはじめからやり直します！"
@@ -292,6 +289,7 @@ def handle_message(event):
         else:
             if text.startswith("候補:"):
                 ticker = text.replace("候補:", "")
+                user_latest_ticker[line_user_id] = ticker
             else:
                 candidates = get_ticker_candidates(text)
                 if not candidates:
@@ -355,23 +353,25 @@ def handle_message(event):
                 )
             )
 # 通知条件のテキストから条件を解析する関数
+# 通知条件のテキストから条件を解析する関数
 def parse_notification_condition(text: str):
     # 毎日
     if "毎日" in text:
-        times = re.findall(r"\d{1,2}時", text)
+        match = re.findall(r"(\d{1,2})時(\d{1,2})?分?", text)
+        times = [f"{h}時{m if m else '00'}分" for h, m in match]
         return {"type": "daily", "times": times}
 
     # 毎週
     elif "毎週" in text:
-        match = re.match(r"毎週(.+?)の(\d{1,2})時", text)
+        match = re.match(r"毎週(.+?)の(\d{1,2})時(\d{1,2})?分?", text)
         if match:
-            return {"type": "weekly", "day": match[1], "time": f"{match[2]}時"}
+            return {"type": "weekly", "day": match[1], "time": f"{match[2]}時{match[3] if match[3] else '00'}分"}
 
     # 毎月
     elif "毎月" in text:
-        match = re.match(r"毎月(\d{1,2})日の(\d{1,2})時", text)
+        match = re.match(r"毎月(\d{1,2})日の(\d{1,2})時(\d{1,2})?分?", text)
         if match:
-            return {"type": "monthly", "day": int(match[1]), "time": f"{match[2]}時"}
+            return {"type": "monthly", "day": int(match[1]), "time": f"{match[2]}時{match[3] if match[3] else '00'}分"}
 
     # 上昇変動通知（%）
     elif re.search(r"\d+%.*上が", text):
@@ -397,15 +397,17 @@ def parse_notification_condition(text: str):
 
 def check_and_send_notifications():
     from datetime import datetime
-    now = datetime.now()
+    from zoneinfo import ZoneInfo
 
-    # 通知設定を取得
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    now_time = f"{now.hour}時{now.minute:02d}分"
+
     notifications = supabase.table("notifications").select("*").execute().data
     for n in notifications:
         user_id = n["line_user_id"]
         cond_type = n["condition_type"]
-        cond_detail = eval(n["condition_detail"])  # JSON文字列を辞書に戻す
-        ticker = n.get("ticker", "7203.T")  # 仮にticker情報を追加
+        cond_detail = eval(n["condition_detail"])
+        ticker = n.get("ticker", "7203.T")
 
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -413,18 +415,17 @@ def check_and_send_notifications():
         prev_close = info.get("previousClose")
 
         if cond_type == "daily":
-            now_hour = f"{now.hour}時"
-            if now_hour in cond_detail.get("times", []):
+            if now_time in cond_detail.get("times", []):
                 send_stock_info(user_id, ticker, info)
 
         elif cond_type == "weekly":
             weekday_map = ["月", "火", "水", "木", "金", "土", "日"]
             today = weekday_map[now.weekday()]
-            if cond_detail["day"] == today and cond_detail["time"] == f"{now.hour}時":
+            if cond_detail["day"] == today and cond_detail["time"] == now_time:
                 send_stock_info(user_id, ticker, info)
 
         elif cond_type == "monthly":
-            if now.day == cond_detail["day"] and cond_detail["time"] == f"{now.hour}時":
+            if now.day == cond_detail["day"] and cond_detail["time"] == now_time:
                 send_stock_info(user_id, ticker, info)
 
         elif cond_type in ["percent_up", "percent_down"]:
