@@ -18,6 +18,11 @@ load_dotenv()
 
 app = FastAPI()
 
+# ルートエンドポイントの追加
+@app.get("/")
+async def root():
+    return {"message": "Hello from Render!"}
+
 # Supabaseクライアントの初期化
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
