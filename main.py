@@ -54,32 +54,43 @@ async def callback(request: Request):
 # Yahooファイナンスから証券コード候補リストを取得（日本株優先、なければ海外株も探索）
 def get_ticker_candidates(company_name: str):
     candidates = []
-
-    # まず、日本株を優先して取得
-    search_url_jp = f"https://finance.yahoo.co.jp/search/?query={company_name}"
+    seen = set()
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 日本株（Yahoo!ファイナンス日本語サイト）
+    search_url_jp = f"https://finance.yahoo.co.jp/search/?query={company_name}"
     res = requests.get(search_url_jp, headers=headers)
     soup = BeautifulSoup(res.text, "lxml")
-
     for h2 in soup.select("h2.SearchItem__name__1ApM"):
         a = h2.find_parent("a", href=True)
         if a and "/quote/" in a["href"]:
             ticker = a["href"].split("/quote/")[-1]
             name = h2.text.strip()
-            # 「.T」が含まれていれば日本株
-            if ".T" in ticker:
-                candidates.append((ticker, name))
+            if ticker not in seen:
+                trimmed_name = name[:20]  # LINEの制限に合わせて最大20文字に切り詰め
+                candidates.append((ticker, trimmed_name))
+                seen.add(ticker)
         if len(candidates) >= 5:
             break
 
-    # 日本株が見つからない場合、海外株も含めて探索
-    if not candidates:
-        stock = yf.Ticker(company_name)
-        info = stock.info
-        long_name = info.get("longName")
-        symbol = info.get("symbol")
-        if long_name and symbol:
-            candidates.append((symbol, long_name))
+    # 海外株（Yahoo! finance search API）
+    try:
+        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={company_name}"
+        res = requests.get(search_url, headers=headers)
+        data = res.json()
+        for item in data.get("quotes", []):
+            symbol = item.get("symbol")
+            name = item.get("shortname") or item.get("longname") or item.get("name")
+            exch_disp = item.get("exchDisp", "")
+            if item.get("quoteType") == "EQUITY" and symbol and name and symbol not in seen:
+                label = f"{name}（{symbol} / {exch_disp}）" if exch_disp else f"{name}（{symbol}）"
+                label = label[:20]  # LINEのquickReplyの制限で20文字以内にトリミング
+                candidates.append((symbol, label))
+                seen.add(symbol)
+            if len(candidates) >= 5:
+                break
+    except Exception:
+        pass
 
     return candidates
 
@@ -196,7 +207,7 @@ def handle_message(event):
             ticker = text.replace("通知設定:", "")
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="通知の条件を下記のように入力してください！\n\n【時間ベースが良い時】\n・毎日5時\n・毎週木曜の17時4分\n・毎月23日の0時\n【変動ベースが良い時】\n・5%上がった時\n・25%下がった時\n・株価が5000円を超えた時\n・株価が1600円を下回った時")
+                TextSendMessage(text="通知の条件を下記のように入力してください！\n\n【時間ベースが良い時】\n・毎日5時\n・毎週木曜の17時4分\n・毎月23日の0時\n【変動ベースが良い時】\n・5%上がった時\n・25%上がった時\n・株価が5000円を超えた時\n・株価が1600円を下回った時")
             )
             return
         # 通知条件の受信時
