@@ -51,23 +51,36 @@ async def callback(request: Request):
     return {"status": "ok"}
 
 
-# Yahooファイナンスから証券コード候補リストを取得
+# Yahooファイナンスから証券コード候補リストを取得（日本株優先、なければ海外株も探索）
 def get_ticker_candidates(company_name: str):
-    search_url = f"https://finance.yahoo.co.jp/search/?query={company_name}"
+    candidates = []
+
+    # まず、日本株を優先して取得
+    search_url_jp = f"https://finance.yahoo.co.jp/search/?query={company_name}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    res = requests.get(search_url, headers=headers)
+    res = requests.get(search_url_jp, headers=headers)
     soup = BeautifulSoup(res.text, "lxml")
 
-    candidates = []
     for h2 in soup.select("h2.SearchItem__name__1ApM"):
-        a = h2.find_parent("a", href=True)  # 企業名が含まれてるリンクを探す
+        a = h2.find_parent("a", href=True)
         if a and "/quote/" in a["href"]:
             ticker = a["href"].split("/quote/")[-1]
             name = h2.text.strip()
+            # 「.T」が含まれていれば日本株
             if ".T" in ticker:
                 candidates.append((ticker, name))
         if len(candidates) >= 5:
             break
+
+    # 日本株が見つからない場合、海外株も含めて探索
+    if not candidates:
+        stock = yf.Ticker(company_name)
+        info = stock.info
+        long_name = info.get("longName")
+        symbol = info.get("symbol")
+        if long_name and symbol:
+            candidates.append((symbol, long_name))
+
     return candidates
 
 # フォローイベントのハンドラを追加
@@ -183,7 +196,7 @@ def handle_message(event):
             ticker = text.replace("通知設定:", "")
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="通知の条件を下記のように入力してください！\n\n【時間ベースが良い時】\n・毎日５時\n・毎週木曜の17時\n・毎月23日の0時\n【変動ベースが良い時】\n・5％上がった時\n・25%下がった時\n・株価が5000円を超えた時\n・株価が1600円を下回った時")
+                TextSendMessage(text="通知の条件を下記のように入力してください！\n\n【時間ベースが良い時】\n・毎日5時\n・毎週木曜の17時4分\n・毎月23日の0時\n【変動ベースが良い時】\n・5%上がった時\n・25%下がった時\n・株価が5000円を超えた時\n・株価が1600円を下回った時")
             )
             return
         # 通知条件の受信時
@@ -223,12 +236,14 @@ def handle_message(event):
         elif text == "通知取り消し選択":
             # 登録済み企業リストを取得
             notifications = supabase.table("notifications").select("ticker").eq("line_user_id", line_user_id).execute().data
-            tickers = list(set(n["ticker"] for n in notifications if "ticker" in n))
-            if not tickers:
+            # 企業コードのペアを収集（value, label両方にtickerを使う）
+            ticker_names = [(n["ticker"], n["ticker"]) for n in notifications if "ticker" in n]
+            ticker_names = list(set(ticker_names))  # 重複除去
+            if not ticker_names:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="現在、通知登録されている企業はありません"))
                 return
             quick_items = [
-                QuickReplyButton(action=MessageAction(label=t, text=f"通知取消:{t}")) for t in tickers
+                QuickReplyButton(action=MessageAction(label=name, text=f"通知取消:{ticker}")) for ticker, name in ticker_names
             ]
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="通知を取り消したい企業を選んでください！",
@@ -252,6 +267,7 @@ def handle_message(event):
                     QuickReplyButton(action=MessageAction(label="いいえ", text="リセット確認:いいえ")),
                 ])
             ))
+            
             return
 
         elif text == "リセット確認:はい":
